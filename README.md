@@ -82,3 +82,14 @@ npm start
 - `public/assets/` is ready for logos, sound, textures, or future uploads
 - If Stripe is not configured, the rest of the app still runs
 - The report JSON schema is identical to MOTOR GENESIS — only the intelligence domain changed, so any downstream tooling keeps working
+
+## FORGE PLAYABLE — pitch it, play it
+
+`POST /api/playable` takes a one-sentence game pitch and has Claude Fable 5 write a complete, self-contained, playable HTML5 prototype — physics, art, input, win/lose states — returned as a single file the developer can play in the browser and download. Free tier: 2 playables per day per IP; VIP and Pro are unlimited. Generated files land in `public/playables/` and are cleaned up after 2 hours. A pre-built sample (`/playables/sample-bakery-siege.html`) plays instantly with no API call — expo-proof.
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/api/playable` | POST | Generate a playable prototype from a pitch (Fable 5) |
+| `/playables/*` | GET | Serve generated + sample playables |
+
+Railway variable: `FORGE_PLAYABLE_MODEL` (optional, defaults to `claude-fable-5`).

@@ -1,7 +1,7 @@
 {
   "name": "forge",
   "version": "1.0.0",
-  "description": "FORGE — Developer Relief Engine for indie game developers, by VYBSTAK",
+  "description": "FORGE \u2014 Developer Relief Engine for indie game developers, by VYBSTAK",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

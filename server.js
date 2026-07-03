@@ -703,6 +703,122 @@ app.post('/api/verify', async (req, res) => {
   } catch(err) { console.error('Stripe verify error:', err); res.status(500).json({ error: 'Verify failed.' }); }
 });
 
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// FORGE PLAYABLE — pitch in, playable prototype out (Claude Fable 5)
+// ═══════════════════════════════════════════════════════════════════════
+const PLAYABLES_DIR = path.join(PUBLIC_DIR, 'playables');
+if (!fs.existsSync(PLAYABLES_DIR)) fs.mkdirSync(PLAYABLES_DIR, { recursive: true });
+setInterval(() => {
+  try {
+    const now = Date.now();
+    fs.readdirSync(PLAYABLES_DIR).forEach(f => {
+      if (!f.startsWith('forge-play-')) return; // never delete samples
+      const p = path.join(PLAYABLES_DIR, f);
+      if (now - fs.statSync(p).mtimeMs > 2 * 3600 * 1000) fs.unlinkSync(p);
+    });
+  } catch (e) {}
+}, 30 * 60 * 1000);
+
+const playableUsage = new Map(); // ip → {count, day}
+const PLAYABLE_FREE_LIMIT = 2;
+function playableAllowed(ip) {
+  const day = new Date().toISOString().slice(0, 10);
+  const u = playableUsage.get(ip);
+  if (!u || u.day !== day) { playableUsage.set(ip, { count: 0, day }); return true; }
+  return u.count < PLAYABLE_FREE_LIMIT;
+}
+function playableCount(ip) {
+  const day = new Date().toISOString().slice(0, 10);
+  const u = playableUsage.get(ip) || { count: 0, day };
+  u.count++; u.day = day; playableUsage.set(ip, u);
+}
+
+const PLAYABLE_SYSTEM = `You are the FORGE PLAYABLE engine — you turn an indie game pitch into a complete, genuinely playable HTML5 prototype in a single response.
+
+OUTPUT CONTRACT — ABSOLUTE:
+- Respond with ONLY a complete single HTML file. First characters: <!DOCTYPE html>. No markdown, no code fences, no commentary before or after.
+- Entirely self-contained: inline CSS + inline JavaScript. NO external assets, images, fonts, audio files, libraries or CDNs. All art is drawn with canvas primitives.
+- Must run offline from a local file with zero errors.
+
+GAME QUALITY BAR:
+- A real playable loop within 3 seconds of loading: clear goal, score, fail state or win state, and instant restart (R key and on-screen button).
+- Controls: keyboard (arrows/WASD + space + one action key) AND basic touch (tap zones or drag). Show a one-line control hint on screen.
+- Game feel: acceleration or easing (nothing teleports), squash/stretch or lean on movement, hit-stop or flash on impacts, screen shake, score pops, juice on every interaction.
+- Difficulty ramps gently over 60-90 seconds of play.
+- 450-900 lines of tight, readable code. No dead code. requestAnimationFrame loop with delta time. Pause on visibility loss.
+- Title the game from the pitch. Animated start screen (click/press to start) and a game-over screen with final score and restart.
+
+RETRO-POLISH VISUAL STACK — MANDATORY. The target look is "a lost 16-bit arcade cabinet, restored in 4K". Every game MUST implement ALL of the following:
+1. LOW-RES PIXEL BUFFER: render the entire game to an offscreen canvas at 480x270 (or 320x180 for a chunkier feel), then upscale to a 960x540 display canvas with imageSmoothingEnabled=false for crisp fat pixels. Letterbox-scale the display canvas to the window, DPR-aware.
+2. LOCKED PALETTE: define a named palette of 8-12 colors at the top of the script (deep shadow tones, 2-3 mid tones, one hot accent, one highlight) and use ONLY those colors. Cohesion over variety.
+3. POST-FX PASS on the display canvas every frame, in order: (a) soft bloom — redraw the low-res buffer once with a blur filter and 'lighter' composite at low alpha so emissive elements genuinely glow; (b) scanlines — a prebuilt overlay canvas of 1px dark lines every 3px at ~10-14% alpha; (c) vignette — a prebuilt radial gradient darkening the corners; (d) impact chromatic ghost — on hits/explosions, briefly redraw the buffer offset ±1-3px with 'lighter' composite at low alpha, decaying over ~0.3s. Prebuild the scanline and vignette canvases ONCE, never per frame. Wrap ctx.filter use in a capability check with a graceful fallback.
+4. EMISSIVE LIGHTING LANGUAGE: pick the light sources of the world (projectiles, cores, lava, neon, magic) and give them halo glows (radial gradients or the bloom pass), gentle pulse animations, and palette-consistent particle trails.
+5. ENVIRONMENTAL DEPTH in the low-res buffer: a background layer with silhouettes/pattern (bricks, stars, machinery, foliage — whatever fits the pitch), a subtle animated element (drifting dust, flicker, rain, embers), and a foreground vignette of shapes framing the play area. Never a flat empty background.
+6. DITHER or texture accents: sparse checkerboard dithering or noise flecks on large surfaces so nothing reads as a flat untextured rectangle.
+7. Pixel-chunky typography: draw HUD text in the low-res buffer with a monospace font at small sizes so it upscales into chunky pixel type.
+Original art only — never reference or imitate existing games' characters or assets.
+
+Honour the pitch: its theme, fantasy and core verb must be unmistakable in the mechanics, not just the title.`;
+
+app.post('/api/playable', async (req, res) => {
+  const pitch = (req.body && req.body.pitch ? String(req.body.pitch) : '').trim();
+  if (pitch.length < 5) return res.status(400).json({ error: 'Describe the game you want to play.' });
+  if (pitch.length > 600) return res.status(400).json({ error: 'Keep the pitch under 600 characters.' });
+
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) return res.status(500).json({ error: 'API key not configured.' });
+
+  const vipHeader = req.headers['x-vip-token'];
+  const isVIP = vipHeader && verifyVIPToken(vipHeader);
+  const proToken = req.body.proToken;
+  const isPro = isVIP || (proToken && verifyProToken(proToken));
+  const ip = getIP(req);
+  if (!isPro) {
+    if (!playableAllowed(ip)) return res.status(429).json({ error: 'Free playables used for today — Pro is unlimited.', code: 'RATE_LIMIT' });
+    playableCount(ip);
+  }
+  const model = process.env.FORGE_PLAYABLE_MODEL || process.env.FORGE_PRO_MODEL || 'claude-fable-5';
+
+  try {
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({
+        model,
+        max_tokens: 16000,
+        system: PLAYABLE_SYSTEM,
+        messages: [{ role: 'user', content: `Build the playable prototype for this pitch:\n\n${pitch}` }],
+      }),
+    });
+    if (!response.ok) {
+      const t = await response.text();
+      console.error('Playable API error:', response.status, t.slice(0, 200));
+      return res.status(502).json({ error: 'Forge Playable engine error. Try again.' });
+    }
+    const data = await response.json();
+    let html = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
+    html = html.replace(/^\s*```(?:html)?/i, '').replace(/```\s*$/, '').trim();
+    const lower = html.slice(0, 400).toLowerCase();
+    if (!lower.includes('<!doctype html') || !html.toLowerCase().includes('<canvas') || html.length < 2500) {
+      console.error('Playable failed validation, len=', html.length);
+      return res.status(502).json({ error: 'Generated playable failed validation. Try a clearer pitch.' });
+    }
+    const fileName = 'forge-play-' + Date.now() + '.html';
+    fs.writeFileSync(path.join(PLAYABLES_DIR, fileName), html, 'utf8');
+    res.json({ url: '/playables/' + fileName, fileName, model, bytes: html.length });
+  } catch (e) {
+    console.error('Playable error:', e.message);
+    res.status(500).json({ error: 'Forge Playable engine error. Try again.' });
+  }
+});
+
+
+// ESCAPE THE ALGORITHM — flagship playable experience
+app.get('/escape-the-algorithm', (req, res) =>
+  res.sendFile(path.join(__dirname, 'public', 'escape-the-algorithm.html')));
+
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
 const PORT = process.env.PORT || 3000;
