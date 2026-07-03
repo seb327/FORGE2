@@ -40,7 +40,8 @@ npm start
 
 ### Core
 - `PORT`
-- `APP_URL`
+- `APP_URL` (optional on Railway; use only for a custom public origin)
+- `GENERATED_ASSETS_DIR` (optional; overrides where generated playables/decks are stored)
 - `SECRET_KEY`
 
 ### Anthropic
@@ -59,9 +60,13 @@ npm start
 
 1. Push this folder to GitHub
 2. Create a new Railway project
-3. Deploy from GitHub
+3. Deploy from GitHub, with the service root set to this `forge` folder if it lives inside a larger repo
 4. Add the values from `.env.example` into Railway Variables
 5. Point your custom domain after the Railway URL works
+
+`APP_URL` is optional on Railway. If it is blank, FORGE uses Railway's `RAILWAY_PUBLIC_DOMAIN` automatically for generated playable/deck links and Stripe redirects. Do not set `APP_URL` to `localhost` in production.
+
+Generated playables and decks are served through explicit `/playables/generated/:id` and `/decks/generated/:fileName` routes. If Railway provides `RAILWAY_VOLUME_MOUNT_PATH`, Forge stores generated files under that mounted volume automatically; otherwise it falls back to the app filesystem and keeps the in-memory/disk expiry window at 2 hours.
 
 ## API surface
 

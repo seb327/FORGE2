@@ -9,12 +9,27 @@ const app = express();
 
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const ASSETS_DIR = path.join(PUBLIC_DIR, 'assets');
+const PUBLIC_PLAYABLES_DIR = path.join(PUBLIC_DIR, 'playables');
+const GENERATED_ROOT = process.env.GENERATED_ASSETS_DIR
+  || (process.env.RAILWAY_VOLUME_MOUNT_PATH ? path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH, 'forge-generated') : PUBLIC_DIR);
+const DECKS_DIR = path.join(GENERATED_ROOT, 'decks');
+const PLAYABLES_DIR = path.join(GENERATED_ROOT, 'playables');
 
-for (const dir of [PUBLIC_DIR, ASSETS_DIR]) {
+for (const dir of [PUBLIC_DIR, ASSETS_DIR, PUBLIC_PLAYABLES_DIR, DECKS_DIR, PLAYABLES_DIR]) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
+
+app.set('trust proxy', 1);
 app.use(express.json({ limit: '2mb' }));
-app.use(express.static(path.join(__dirname, 'public')));
+app.use('/decks', express.static(DECKS_DIR, { index: false, maxAge: '1h' }));
+app.use('/playables', express.static(PUBLIC_PLAYABLES_DIR, {
+  index: false,
+  maxAge: '2h',
+  setHeaders(res) {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+  },
+}));
+app.use(express.static(PUBLIC_DIR));
 
 // Rate limiting by IP (no Firebase required)
 const usageMap = new Map();
@@ -54,6 +69,80 @@ async function getUser(req) {
 
 function getIP(req) {
   return (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.ip || '0.0.0.0';
+}
+
+function normalizeOrigin(value) {
+  if (!value) return '';
+  let raw = String(value).trim().replace(/\/+$/, '');
+  if (!raw) return '';
+  if (!/^https?:\/\//i.test(raw)) raw = `https://${raw}`;
+  try { return new URL(raw).origin; }
+  catch { return ''; }
+}
+
+function isLoopbackOrigin(origin) {
+  try {
+    const { hostname } = new URL(origin);
+    return ['localhost', '127.0.0.1', '0.0.0.0', '::1', '[::1]'].includes(hostname);
+  } catch { return false; }
+}
+
+function getConfiguredOrigin() {
+  const appUrl = normalizeOrigin(process.env.APP_URL);
+  const railwayUrl = normalizeOrigin(process.env.RAILWAY_PUBLIC_DOMAIN);
+  if (appUrl && !(railwayUrl && isLoopbackOrigin(appUrl))) return appUrl;
+  return railwayUrl || appUrl;
+}
+
+function getPublicOrigin(req) {
+  const configured = getConfiguredOrigin();
+  if (configured) return configured;
+  const requestOrigin = normalizeOrigin(`${req.protocol}://${req.get('host')}`);
+  return requestOrigin || `http://localhost:${process.env.PORT || 3000}`;
+}
+
+function publicUrl(req, pathname) {
+  return new URL(pathname, getPublicOrigin(req)).toString();
+}
+
+function safeSlug(value, fallback = 'forge') {
+  return String(value || fallback)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 48) || fallback;
+}
+
+const generatedPlayables = new Map();
+
+function isGeneratedId(id) {
+  return /^[a-f0-9]{20}$/.test(String(id || ''));
+}
+
+function rememberPlayable(id, html, fileName) {
+  generatedPlayables.set(id, { html, fileName, createdAt: Date.now() });
+}
+
+function loadPlayable(id) {
+  if (!isGeneratedId(id)) return null;
+  const cached = generatedPlayables.get(id);
+  if (cached) return cached;
+  try {
+    const fileName = fs.readdirSync(PLAYABLES_DIR)
+      .find(file => file.startsWith(`${id}-`) && file.endsWith('.html'));
+    if (!fileName) return null;
+    const html = fs.readFileSync(path.join(PLAYABLES_DIR, fileName), 'utf8');
+    const stat = fs.statSync(path.join(PLAYABLES_DIR, fileName));
+    const record = { html, fileName, createdAt: stat.mtimeMs };
+    generatedPlayables.set(id, record);
+    return record;
+  } catch {
+    return null;
+  }
+}
+
+function isSafeFileName(fileName, extension) {
+  return path.basename(fileName) === fileName && fileName.endsWith(extension);
 }
 
 // System prompt
@@ -347,10 +436,6 @@ app.post('/api/forge', async (req, res) => {
 
 
 // ── LAUNCHPAD — Native PPTX Pitch Deck Generator (Pro only) ─────────
-const DECKS_DIR = path.join(PUBLIC_DIR, 'decks');
-if (!fs.existsSync(DECKS_DIR)) fs.mkdirSync(DECKS_DIR, { recursive: true });
-app.use('/decks', express.static(DECKS_DIR, { maxAge: '1h' }));
-
 // Cleanup old decks (>2h)
 setInterval(() => {
   try {
@@ -670,7 +755,8 @@ app.post('/api/launchpad', async (req, res) => {
     const filePath = path.join(DECKS_DIR, fileName);
     await pres.writeFile({ fileName: filePath });
     console.log('FORGE DECK: generated', fileName);
-    res.json({ downloadUrl: '/decks/' + fileName, fileName });
+    const downloadUrl = '/decks/generated/' + encodeURIComponent(fileName);
+    res.json({ downloadUrl, absoluteDownloadUrl: publicUrl(req, downloadUrl), fileName });
   } catch(err) {
     console.error('Launchpad error:', err);
     res.status(500).json({ error: 'Failed to generate pitch deck.' });
@@ -679,7 +765,7 @@ app.post('/api/launchpad', async (req, res) => {
 
 app.post('/api/checkout', async (req, res) => {
   if (!stripe) return res.status(500).json({ error: 'Stripe not configured.' });
-  const baseUrl = process.env.APP_URL || `http://localhost:${process.env.PORT || 3000}`;
+  const baseUrl = getPublicOrigin(req);
   try {
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription', payment_method_types: ['card'],
@@ -708,13 +794,14 @@ app.post('/api/verify', async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════
 // FORGE PLAYABLE — pitch in, playable prototype out (Claude Fable 5)
 // ═══════════════════════════════════════════════════════════════════════
-const PLAYABLES_DIR = path.join(PUBLIC_DIR, 'playables');
-if (!fs.existsSync(PLAYABLES_DIR)) fs.mkdirSync(PLAYABLES_DIR, { recursive: true });
 setInterval(() => {
   try {
     const now = Date.now();
+    for (const [id, record] of generatedPlayables.entries()) {
+      if (now - record.createdAt > 2 * 3600 * 1000) generatedPlayables.delete(id);
+    }
     fs.readdirSync(PLAYABLES_DIR).forEach(f => {
-      if (!f.startsWith('forge-play-')) return; // never delete samples
+      if (!f.endsWith('.html')) return;
       const p = path.join(PLAYABLES_DIR, f);
       if (now - fs.statSync(p).mtimeMs > 2 * 3600 * 1000) fs.unlinkSync(p);
     });
@@ -805,9 +892,14 @@ app.post('/api/playable', async (req, res) => {
       console.error('Playable failed validation, len=', html.length);
       return res.status(502).json({ error: 'Generated playable failed validation. Try a clearer pitch.' });
     }
-    const fileName = 'forge-play-' + Date.now() + '.html';
-    fs.writeFileSync(path.join(PLAYABLES_DIR, fileName), html, 'utf8');
-    res.json({ url: '/playables/' + fileName, fileName, model, bytes: html.length });
+    const playableId = crypto.randomBytes(10).toString('hex');
+    const fileName = `${playableId}-${safeSlug(pitch, 'prototype')}.html`;
+    const filePath = path.join(PLAYABLES_DIR, fileName);
+    fs.writeFileSync(filePath, html, 'utf8');
+    rememberPlayable(playableId, html, fileName);
+    const bytes = fs.statSync(filePath).size;
+    const url = '/playables/generated/' + playableId;
+    res.json({ url, absoluteUrl: publicUrl(req, url), playableId, fileName, model, bytes });
   } catch (e) {
     console.error('Playable error:', e.message);
     res.status(500).json({ error: 'Forge Playable engine error. Try again.' });
@@ -816,6 +908,35 @@ app.post('/api/playable', async (req, res) => {
 
 
 // ESCAPE THE ALGORITHM — flagship playable experience
+app.get('/playables/generated/:id', (req, res) => {
+  const record = loadPlayable(req.params.id);
+  if (!record) {
+    return res.status(404).type('text/plain').send('Playable not found. Generated playables expire after 2 hours; generate a fresh link and try again.');
+  }
+  res.setHeader('Cache-Control', 'private, max-age=7200');
+  res.type('html').send(record.html);
+});
+
+app.get('/decks/generated/:fileName', (req, res) => {
+  const fileName = req.params.fileName;
+  if (!isSafeFileName(fileName, '.pptx')) {
+    return res.status(404).type('text/plain').send('Deck not found.');
+  }
+  const filePath = path.join(DECKS_DIR, fileName);
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).type('text/plain').send('Deck not found. Generated decks expire after 2 hours; generate a fresh deck and try again.');
+  }
+  res.download(filePath, fileName);
+});
+
+app.use('/playables', (req, res) => {
+  res.status(404).type('text/plain').send('Playable not found. Generated playables expire after 2 hours; generate a fresh link and try again.');
+});
+
+app.use('/decks', (req, res) => {
+  res.status(404).type('text/plain').send('Deck not found. Generated decks expire after 2 hours; generate a fresh deck and try again.');
+});
+
 app.get('/escape-the-algorithm', (req, res) =>
   res.sendFile(path.join(__dirname, 'public', 'escape-the-algorithm.html')));
 

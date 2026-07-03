@@ -4,6 +4,7 @@
   "description": "FORGE \u2014 Developer Relief Engine for indie game developers, by VYBSTAK",
   "main": "server.js",
   "scripts": {
+    "build": "node --check server.js",
     "start": "node server.js",
     "dev": "nodemon server.js"
   },
